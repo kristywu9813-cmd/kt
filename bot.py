@@ -1,956 +1,979 @@
 """
-AI Execution Companion OS — Telegram Bot
-=========================================
-每次 session 完成一个 2-10 分钟的最小行动步。
-用微干预解决"认知高执行低"的卡点。
-
-使用方法:
-1. pip install python-telegram-bot==20.7 apscheduler
-2. 设置环境变量 TELEGRAM_BOT_TOKEN
-3. python bot.py
+AI Execution Companion OS v2 — Telegram Bot
+=============================================
+极简主流程：/today → 自动锁定A → 开始2分钟 → 完成/升级/卡住 → 证据
+管理入口：/manage → /goal /phases /tasks /settings
 """
 
 import os
 import json
 import logging
+import asyncio
 from datetime import datetime, date
-from enum import Enum
-from dataclasses import dataclass, field, asdict
-from typing import Optional
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    Application,
-    CommandHandler,
-    CallbackQueryHandler,
-    MessageHandler,
-    ConversationHandler,
-    ContextTypes,
-    filters,
+    Application, CommandHandler, CallbackQueryHandler,
+    MessageHandler, ContextTypes, filters,
 )
 
-# ── Logging ──
+from db import database as db
+from core import engine
+from llm import openai_client as llm
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
 # ═══════════════════════════════════════════
-# DATA MODELS
+# KEYBOARD HELPERS
 # ═══════════════════════════════════════════
 
-class FSM(str, Enum):
-    NO_MAINLINE = "NO_MAINLINE"
-    CLARIFY = "CLARIFY"
-    CANDIDATES = "CANDIDATES"
-    MAINLINE_LOCKED = "MAINLINE_LOCKED"
-    NEXT_STEP_READY = "NEXT_STEP_READY"
-    EXECUTING = "EXECUTING"
-    STUCK_PICK = "STUCK_PICK"
-    INTERVENTION = "INTERVENTION"
-    SESSION_REVIEW = "SESSION_REVIEW"
-    SESSION_END = "SESSION_END"
-
-
-class StuckType(str, Enum):
-    PERFECTIONISM = "PERFECTIONISM"
-    GOAL_TOO_BIG = "GOAL_TOO_BIG"
-    OVERTHINKING = "OVERTHINKING"
-    EMOTIONAL_FRICTION = "EMOTIONAL_FRICTION"
-    REWARD_MISMATCH = "REWARD_MISMATCH"
-    SELF_LIMITING = "SELF_LIMITING"
-
-
-STUCK_LABELS = {
-    StuckType.PERFECTIONISM: ("✨", "完美主义瘫痪"),
-    StuckType.GOAL_TOO_BIG: ("🏔", "目标太大了"),
-    StuckType.OVERTHINKING: ("🌀", "想太多"),
-    StuckType.EMOTIONAL_FRICTION: ("😶‍🌫️", "情绪内耗"),
-    StuckType.REWARD_MISMATCH: ("📱", "想刷手机"),
-    StuckType.SELF_LIMITING: ("🔒", "觉得自己不行"),
-}
-
-
-@dataclass
-class Course:
-    name: str
-    status: str = "not_started"  # not_started | in_progress | completed
-
-
-@dataclass
-class Step:
-    instruction: str
-    acceptance_criteria: str
-    duration_min: int = 8
-    difficulty: int = 1
-
-
-@dataclass
-class Evidence:
-    text: str
-    timestamp: str = ""
-    tags: list = field(default_factory=lambda: ["small_win"])
-
-    def __post_init__(self):
-        if not self.timestamp:
-            self.timestamp = datetime.now().isoformat()
-
-
-@dataclass
-class UserSession:
-    """Per-user state, stored in bot_data or persistence."""
-    fsm: str = FSM.NO_MAINLINE
-    # Longline
-    longline_goal: Optional[str] = None
-    longline_deadline: Optional[str] = None
-    courses: list = field(default_factory=list)
-    # Daily
-    mainline_title: Optional[str] = None
-    mainline_source: str = "manual"
-    time_budget: Optional[str] = None
-    definition_of_win: Optional[str] = None
-    # Current step
-    current_step: Optional[dict] = None
-    # History
-    stuck_events: list = field(default_factory=list)
-    evidence: list = field(default_factory=list)
-    # Streak
-    streak_days: int = 0
-    last_progress_date: Optional[str] = None
-
-    def record_progress(self):
-        today = date.today().isoformat()
-        if self.last_progress_date != today:
-            self.streak_days += 1
-            self.last_progress_date = today
-
-
-def get_session(context: ContextTypes.DEFAULT_TYPE) -> UserSession:
-    if "session" not in context.user_data:
-        context.user_data["session"] = UserSession()
-    s = context.user_data["session"]
-    # Handle case where it's a dict (from persistence)
-    if isinstance(s, dict):
-        s = UserSession(**s)
-        context.user_data["session"] = s
-    return s
-
-
-def save_session(context: ContextTypes.DEFAULT_TYPE, session: UserSession):
-    context.user_data["session"] = session
-
-
-# ═══════════════════════════════════════════
-# AI ENGINE — generates structured responses
-# ═══════════════════════════════════════════
-
-class AI:
-
-    BIG_GOAL_KEYWORDS = ["天", "学位", "毕业", "全部", "所有", "完成整个", "master", "degree", "finish all", "月内"]
-
-    @staticmethod
-    def is_big_goal(text: str) -> bool:
-        t = text.lower()
-        return any(kw in t for kw in AI.BIG_GOAL_KEYWORDS)
-
-    @staticmethod
-    def generate_candidates(courses: list[Course]) -> dict:
-        in_progress = [c for c in courses if c.status == "in_progress"]
-        not_started = [c for c in courses if c.status == "not_started"]
-        primary = (in_progress or not_started or [None])[0]
-        secondary = (in_progress[1:] or not_started[1:] or [primary])[0] if primary else None
-
-        a_title = f"推进「{primary.name}」— 完成下一个学习单元" if primary else "推进当前最紧急的任务"
-        a_reason = f"{primary.name} 正在进行中，保持势头" if primary and primary.status == "in_progress" else "优先启动第一个任务"
-
-        if secondary and secondary != primary:
-            b_title = f"轻量推进「{secondary.name}」— 阅读/整理笔记"
-            b_reason = "低能量也能做，不浪费今天"
-        else:
-            b_title = "整理学习计划 / 预约辅导 / 复习旧笔记"
-            b_reason = "低能量也能推进一步"
-
-        return {
-            "A": {"title": a_title, "reason": a_reason},
-            "B": {"title": b_title, "reason": b_reason},
-        }
-
-    @staticmethod
-    def generate_step(mainline_title: str, time_budget: str = None) -> Step:
-        duration = 5 if time_budget and "15" in time_budget else 10 if time_budget and "90" in time_budget else 8
-        # Extract core subject from mainline title
-        core = mainline_title.replace("推进", "").replace("轻量", "").strip("「」—— ")
-        return Step(
-            instruction=f"打开「{core[:20]}」相关材料，找到你上次停下的位置，阅读接下来的 1 个小节（不超过 2 页）。",
-            acceptance_criteria="能用 1 句话说出这个小节讲了什么",
-            duration_min=duration,
-            difficulty=1,
-        )
-
-    @staticmethod
-    def shrink_step(step: dict) -> Step:
-        original = step.get("instruction", "") if step else ""
-        first_action = original.split("，")[0] if "，" in original else "打开需要的文件或页面"
-        return Step(
-            instruction=f"只做一件事：{first_action}。做完就算赢。",
-            acceptance_criteria="完成了这一个动作（不管质量）",
-            duration_min=2,
-            difficulty=1,
-        )
-
-    @staticmethod
-    def generate_intervention(stuck_type: StuckType) -> dict:
-        data = {
-            StuckType.PERFECTIONISM: {
-                "intervention_text": (
-                    "完美是个陷阱 — 它假装在帮你，其实在拦你。\n\n"
-                    "现在做一个深呼吸。\n"
-                    "我们的目标不是「做好」，是「做了」。\n"
-                    "写一个烂版本，比空白强一万倍。"
-                ),
-                "restart_step": Step(
-                    instruction="用最丑、最烂的方式，写下关于这个任务你知道的 3 个词。不准修改。",
-                    acceptance_criteria="屏幕上出现了 3 个词（质量零要求）",
-                    duration_min=2,
-                ),
-                "push_line": "烂版本已经比空白好了。计时器开始 →",
-            },
-            StuckType.GOAL_TOO_BIG: {
-                "intervention_text": (
-                    "大象怎么吃？一口一口。\n\n"
-                    "你不需要看到终点，只需要看到下一步。\n"
-                    "现在这一步只有 2 分钟。"
-                ),
-                "restart_step": Step(
-                    instruction="只做一件事：打开你需要的那个页面/文件/工具。打开就行，不用做别的。",
-                    acceptance_criteria="目标页面/文件已经打开在屏幕上",
-                    duration_min=2,
-                ),
-                "push_line": "打开了？你已经开始了。继续 →",
-            },
-            StuckType.OVERTHINKING: {
-                "intervention_text": (
-                    "你的大脑在转圈，不是在前进。\n\n"
-                    "现在停下来，双手握拳 3 秒，松开。\n"
-                    "不需要想清楚才开始，开始了才会想清楚。"
-                ),
-                "restart_step": Step(
-                    instruction="不做选择 — 直接做第一个动作：打开/点击/写第一个字。",
-                    acceptance_criteria="已经动手做了第一个物理动作",
-                    duration_min=2,
-                ),
-                "push_line": "动了就对了。计时器走起 →",
-            },
-            StuckType.EMOTIONAL_FRICTION: {
-                "intervention_text": (
-                    "先给这个情绪取个名字（烦躁？焦虑？疲惫？）\n\n"
-                    "说出来：「我现在感到 ____。」\n"
-                    "然后把双脚踩实地面，感受脚底的压力。\n"
-                    "情绪不需要消失，我们带着它做 2 分钟。"
-                ),
-                "restart_step": Step(
-                    instruction="带着这个情绪，只做一件最小的事：写下今天任务的标题。",
-                    acceptance_criteria="写下了标题",
-                    duration_min=2,
-                ),
-                "push_line": "情绪还在？没关系，我们已经在动了 →",
-            },
-            StuckType.REWARD_MISMATCH: {
-                "intervention_text": (
-                    "手机的奖励是即时的，但也是空的。\n\n"
-                    "试试这个：先做 2 分钟，做完了你再刷 — \n"
-                    "带着「我完成了一步」的感觉刷，味道完全不一样。"
-                ),
-                "restart_step": Step(
-                    instruction="把手机翻面朝下放在伸手够不到的地方，然后打开任务材料。",
-                    acceptance_criteria="手机已远离 + 任务材料已打开",
-                    duration_min=2,
-                ),
-                "push_line": "2 分钟后你自由了。开始 →",
-            },
-            StuckType.SELF_LIMITING: {
-                "intervention_text": (
-                    "「我不行」是一个想法，不是事实。\n\n"
-                    "看看你之前的证据 — 你也觉得不行过，但你做到了。\n"
-                    "现在不需要「行」，只需要「试 2 分钟」。"
-                ),
-                "restart_step": Step(
-                    instruction="写下这句话：「我不确定我行，但我可以试 2 分钟。」然后开始做。",
-                    acceptance_criteria="写下了这句话并开始了第一个动作",
-                    duration_min=2,
-                ),
-                "push_line": "试了就是证据。走 →",
-            },
-        }
-        return data[stuck_type]
-
-
-# ═══════════════════════════════════════════
-# KEYBOARD BUILDERS
-# ═══════════════════════════════════════════
-
-def kb(buttons: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
-    """Shorthand: buttons = [[("text","callback_data"), ...], ...]"""
+def kb(buttons):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(text=t, callback_data=d) for t, d in row]
         for row in buttons
     ])
 
-
-def main_menu_kb():
-    return kb([
-        [("🎯 直接填写今日主线", "mode_manual")],
-        [("🧭 设置长线目标 + 课程", "mode_longline")],
-    ])
-
-
-def time_budget_kb():
-    return kb([
-        [("15 分钟", "time_15"), ("30 分钟", "time_30")],
-        [("60 分钟", "time_60"), ("90+ 分钟", "time_90")],
-    ])
-
-
-def win_definition_kb():
-    return kb([
-        [("推进一点点", "win_push")],
-        [("完成一次练习/测验", "win_quiz")],
-        [("提交/预约一件事", "win_submit")],
-    ])
-
-
-def candidate_kb():
-    return kb([
-        [("🅰️ 锁定 A", "lock_A")],
-        [("🅱️ 锁定 B", "lock_B")],
-        [("✏️ 手动填写", "mode_manual")],
-    ])
-
-
-def step_ready_kb(duration: int):
-    return kb([
-        [("⏱ 开始计时（{} 分钟）".format(duration), "timer_start")],
-    ])
-
-
-def executing_kb():
-    return kb([
-        [("✅ 完成了", "step_done")],
-        [("🧱 卡住了", "step_stuck"), ("↩️ 太难了，缩小", "step_shrink")],
-    ])
-
-
-def stuck_type_kb():
-    rows = []
-    items = list(STUCK_LABELS.items())
-    for i in range(0, len(items), 2):
-        row = []
-        for st, (icon, label) in items[i:i + 2]:
-            row.append((f"{icon} {label}", f"stuck_{st.value}"))
-        rows.append(row)
-    rows.append([("↩️ 返回", "stuck_cancel")])
-    return kb(rows)
-
-
-def review_kb():
-    return kb([
-        [("🔄 继续下一步", "review_continue")],
-        [("🌙 今天到此为止", "review_end")],
-    ])
-
-
-def stuck_tag_kb():
-    """For optional review tagging."""
-    rows = []
-    items = list(STUCK_LABELS.items())
-    for i in range(0, len(items), 2):
-        row = []
-        for st, (icon, label) in items[i:i + 2]:
-            row.append((f"{icon} {label}", f"tag_{st.value}"))
-        rows.append(row)
-    rows.append([("跳过", "tag_skip")])
-    return kb(rows)
-
-
-def restart_kb():
-    return kb([
-        [("🎯 开始新 Session", "restart")],
-    ])
-
-
 # ═══════════════════════════════════════════
-# MESSAGE FORMATTERS
+# /start
 # ═══════════════════════════════════════════
 
-def fmt_step_card(step: dict, mainline: str = None) -> str:
-    lines = []
-    if mainline:
-        lines.append(f"📌 *今日主线*：{_esc(mainline)}\n")
-    lines.append(f"🔹 *下一步*（{step['duration_min']} 分钟）\n")
-    lines.append(f"{_esc(step['instruction'])}\n")
-    lines.append(f"✅ 验收：{_esc(step['acceptance_criteria'])}")
-    return "\n".join(lines)
-
-
-def fmt_intervention(stuck_type: StuckType, data: dict) -> str:
-    icon, label = STUCK_LABELS[stuck_type]
-    lines = [
-        f"{icon} *{_esc(label)}*\n",
-        f"{_esc(data['intervention_text'])}\n",
-        "─────────────\n",
-        f"🔸 *起步动作*（{data['restart_step'].duration_min} 分钟）\n",
-        f"{_esc(data['restart_step'].instruction)}\n",
-        f"✅ {_esc(data['restart_step'].acceptance_criteria)}\n",
-        f"\n💬 _{_esc(data['push_line'])}_",
-    ]
-    return "\n".join(lines)
-
-
-def fmt_review(session: UserSession) -> str:
-    evidence = f"我今天完成了：{session.mainline_title}"
-    if session.current_step:
-        evidence += f" → {session.current_step.get('instruction', '')[:40]}…"
-    lines = [
-        "✅ *推进了 1 步*\n",
-        f"📋 {_esc(evidence)}\n",
-        f"🔥 连续推进 *{session.streak_days}* 天\n",
-        "─────────────\n",
-        "今天卡在哪了？（可选，帮助识别模式）",
-    ]
-    return "\n".join(lines)
-
-
-def fmt_session_end(session: UserSession) -> str:
-    lines = [
-        "🌙 *今天的推进完成了*\n",
-        f"🔥 连续推进 *{session.streak_days}* 天",
-    ]
-    if session.evidence:
-        lines.append("\n─────────────")
-        lines.append(f"📋 *证据库*（共 {len(session.evidence)} 条）\n")
-        for ev in session.evidence[-5:]:
-            lines.append(f"  • {_esc(ev['text'][:50])}")
-    lines.append("\n\n每一步都是证据。明天见。")
-    return "\n".join(lines)
-
-
-def _esc(text: str) -> str:
-    """Escape markdown v2 special chars (simplified for MarkdownV1)."""
-    # Using Markdown V1 which needs less escaping
-    return text.replace("_", "\\_").replace("*", "\\*").replace("`", "\\`") if text else ""
-
-
-# Actually let's use HTML parse mode to avoid markdown escaping pain
-def fmt_step_card_html(step: dict, mainline: str = None) -> str:
-    lines = []
-    if mainline:
-        lines.append(f"📌 <b>今日主线</b>：{mainline}\n")
-    lines.append(f"🔹 <b>下一步</b>（{step['duration_min']} 分钟）\n")
-    lines.append(f"{step['instruction']}\n")
-    lines.append(f"✅ 验收：<i>{step['acceptance_criteria']}</i>")
-    return "\n".join(lines)
-
-
-def fmt_intervention_html(stuck_type: StuckType, data: dict) -> str:
-    icon, label = STUCK_LABELS[stuck_type]
-    step = data["restart_step"]
-    return (
-        f"{icon} <b>{label}</b>\n\n"
-        f"{data['intervention_text']}\n\n"
-        f"─────────────\n\n"
-        f"🔸 <b>起步动作</b>（{step.duration_min} 分钟）\n\n"
-        f"{step.instruction}\n\n"
-        f"✅ {step.acceptance_criteria}\n\n"
-        f"💬 <i>{data['push_line']}</i>"
-    )
-
-
-def fmt_review_html(session: UserSession) -> str:
-    evidence = f"我今天完成了：{session.mainline_title}"
-    if session.current_step:
-        evidence += f" → {session.current_step.get('instruction', '')[:40]}…"
-    return (
-        f"✅ <b>推进了 1 步</b>\n\n"
-        f"📋 {evidence}\n\n"
-        f"🔥 连续推进 <b>{session.streak_days}</b> 天\n\n"
-        f"─────────────\n\n"
-        f"今天卡在哪了？（可选，帮助识别模式）"
-    )
-
-
-def fmt_session_end_html(session: UserSession) -> str:
-    lines = [
-        "🌙 <b>今天的推进完成了</b>\n",
-        f"🔥 连续推进 <b>{session.streak_days}</b> 天",
-    ]
-    if session.evidence:
-        lines.append("\n─────────────")
-        lines.append(f"📋 <b>证据库</b>（共 {len(session.evidence)} 条）\n")
-        for ev in session.evidence[-5:]:
-            lines.append(f"  · {ev['text'][:60]}")
-    lines.append("\n\n每一步都是证据。明天见。")
-    return "\n".join(lines)
-
-
-# ═══════════════════════════════════════════
-# HANDLERS
-# ═══════════════════════════════════════════
-
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Entry point: /start"""
-    session = UserSession()
-    save_session(context, session)
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    db.ensure_user(user_id)
     await update.message.reply_text(
         "🎯 <b>Execution Companion</b>\n\n"
-        "今天只做一件事。\n"
-        "锁定你的推进点，然后我们一步一步走。",
+        "今天只做一件事，一步一步走。\n\n"
+        "👉 /today — 开始今天的推进\n"
+        "⚙️ /manage — 管理目标/任务",
         parse_mode="HTML",
-        reply_markup=main_menu_kb(),
+        reply_markup=kb([
+            [("▶️ 开始今天", "cmd_today")],
+            [("⚙️ 管理", "cmd_manage")],
+        ]),
     )
 
+# ═══════════════════════════════════════════
+# /today — 主流程核心
+# ═══════════════════════════════════════════
 
-async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/reset — restart session keeping evidence & streak"""
-    session = get_session(context)
-    session.fsm = FSM.NO_MAINLINE
-    session.mainline_title = None
-    session.current_step = None
-    session.stuck_events = []
-    session.time_budget = None
-    session.definition_of_win = None
-    save_session(context, session)
-    await update.message.reply_text(
-        "🔄 Session 已重置。\n\n今天只做一件事。",
-        parse_mode="HTML",
-        reply_markup=main_menu_kb(),
-    )
+async def cmd_today(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    msg = update.message or update.callback_query.message
+    user_id = update.effective_user.id
+    db.ensure_user(user_id)
 
+    if update.callback_query:
+        await update.callback_query.answer()
 
-async def cmd_evidence(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/evidence — show evidence history"""
-    session = get_session(context)
-    if not session.evidence:
-        await update.message.reply_text("📋 证据库还是空的。完成你的第一步，收集第一条证据。")
-        return
-    lines = [f"📋 <b>证据库</b>（{len(session.evidence)} 条）\n"]
-    for ev in session.evidence[-10:]:
-        lines.append(f"  · {ev['text'][:60]}")
-    lines.append(f"\n🔥 连续推进 <b>{session.streak_days}</b> 天")
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+    # ── 1. Check deferred step ──
+    deferred = db.get_deferred(user_id)
+    if deferred:
+        ctx.user_data["current_step_id"] = deferred["deferred_step_id"]
+        ctx.user_data["current_mainline_id"] = deferred["mainline_id"]
+        db.update_step(deferred["deferred_step_id"], status="ready")
+        db.clear_deferred(user_id)
 
-
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/status — show current state"""
-    session = get_session(context)
-    lines = [f"📊 <b>当前状态</b>：{session.fsm}\n"]
-    if session.longline_goal:
-        lines.append(f"🧭 长线目标：{session.longline_goal}")
-    if session.courses:
-        lines.append(f"📚 课程数：{len(session.courses)}")
-    if session.mainline_title:
-        lines.append(f"📌 今日主线：{session.mainline_title}")
-    lines.append(f"🔥 连续推进：{session.streak_days} 天")
-    lines.append(f"📋 证据数：{len(session.evidence)}")
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
-
-
-# ── Callback Query Router ──
-
-async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Routes all inline keyboard callbacks."""
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-    session = get_session(context)
-
-    # ── Mode selection ──
-    if data == "mode_manual":
-        session.fsm = FSM.NO_MAINLINE
-        save_session(context, session)
-        await query.edit_message_text(
-            "✏️ 今天做到哪算赢？\n\n直接发一条消息告诉我，例如：\n"
-            "<i>完成 C 语言第 3 章练习题</i>",
-            parse_mode="HTML",
+        text = (
+            f"📌 <b>继续昨天的推进</b>\n\n"
+            f"🔹 {deferred['mainline_title']}\n\n"
+            f"{deferred['instruction']}\n\n"
+            f"✅ {deferred['acceptance_criteria']}"
         )
+        await _send(msg, text, kb([
+            [("▶️ 开始 2 分钟", "timer_micro")],
+            [("🔄 换一个新任务", "today_fresh")],
+        ]))
         return
 
-    if data == "mode_longline":
-        session.fsm = "LONGLINE_SETUP"
-        save_session(context, session)
-        await query.edit_message_text(
-            "🧭 <b>设置长线目标</b>\n\n"
-            "发一条消息告诉我你的大目标，例如：\n"
-            "<i>180 天拿到 WGU CS 学位</i>",
-            parse_mode="HTML",
-        )
-        return
-
-    # ── Time budget (clarify) ──
-    if data.startswith("time_"):
-        t = data.replace("time_", "")
-        session.time_budget = f"{t} 分钟"
-        save_session(context, session)
-        await query.edit_message_text(
-            f"⏱ 时间预算：<b>{t} 分钟</b>\n\n做到哪算赢？",
-            parse_mode="HTML",
-            reply_markup=win_definition_kb(),
-        )
-        return
-
-    # ── Win definition (clarify) ──
-    if data.startswith("win_"):
-        win_map = {"win_push": "推进一点点", "win_quiz": "完成一次练习/测验", "win_submit": "提交/预约一件事"}
-        session.definition_of_win = win_map.get(data, "推进一点点")
-
-        # Rewrite intercepted big goal into actionable mainline
-        if session.fsm == FSM.CLARIFY and session.mainline_title:
-            rewritten = f"{session.mainline_title[:15]}… → 今天 {session.time_budget or '30 分钟'}内{session.definition_of_win}"
-            session.mainline_title = rewritten
-
-        session.fsm = FSM.MAINLINE_LOCKED
-        save_session(context, session)
-        await _generate_and_show_step(query, context, session)
-        return
-
-    # ── Lock candidates ──
-    if data in ("lock_A", "lock_B"):
-        key = data.split("_")[1]
-        candidates = context.user_data.get("candidates", {})
-        chosen = candidates.get(key, {})
-        session.mainline_title = chosen.get("title", "推进任务")
-        session.mainline_source = "auto_from_longline"
-        session.fsm = FSM.MAINLINE_LOCKED
-        save_session(context, session)
-        await _generate_and_show_step(query, context, session)
-        return
-
-    # ── Timer start ──
-    if data == "timer_start":
-        session.fsm = FSM.EXECUTING
-        save_session(context, session)
-        duration = session.current_step.get("duration_min", 8) if session.current_step else 8
-        await query.edit_message_text(
-            f"⏱ <b>计时开始！</b>（{duration} 分钟）\n\n"
-            f"{session.current_step.get('instruction', '') if session.current_step else ''}\n\n"
-            f"做完了点「完成」，卡住了点「卡住」。",
-            parse_mode="HTML",
-            reply_markup=executing_kb(),
-        )
-        return
-
-    # ── Step done ──
-    if data == "step_done":
-        session.fsm = FSM.SESSION_REVIEW
-        session.record_progress()
-        evidence = Evidence(
-            text=f"完成了：{session.mainline_title} → {session.current_step.get('instruction', '')[:40] if session.current_step else ''}…"
-        )
-        session.evidence.append({"text": evidence.text, "timestamp": evidence.timestamp, "tags": evidence.tags})
-        save_session(context, session)
-        await query.edit_message_text(
-            fmt_review_html(session),
-            parse_mode="HTML",
-            reply_markup=stuck_tag_kb(),
-        )
-        return
-
-    # ── Stuck ──
-    if data == "step_stuck":
-        session.fsm = FSM.STUCK_PICK
-        save_session(context, session)
-        await query.edit_message_text(
-            "什么卡住了你？",
-            reply_markup=stuck_type_kb(),
-        )
-        return
-
-    if data.startswith("stuck_") and data != "stuck_cancel":
-        st_value = data.replace("stuck_", "")
-        try:
-            stuck_type = StuckType(st_value)
-        except ValueError:
-            await query.edit_message_text("未知类型，请重试。", reply_markup=stuck_type_kb())
+    # ── 2. Check existing today mainline ──
+    existing = db.get_today_mainline(user_id)
+    if existing:
+        step = db.get_active_step(existing["mainline_id"])
+        if step:
+            ctx.user_data["current_step_id"] = step["step_id"]
+            ctx.user_data["current_mainline_id"] = existing["mainline_id"]
+            await _show_step(msg, existing["title"], step)
             return
 
-        session.fsm = FSM.INTERVENTION
-        session.stuck_events.append({"type": st_value, "timestamp": datetime.now().isoformat()})
-        save_session(context, session)
+    # ── 3. Generate candidates ──
+    await _generate_and_show_today(msg, ctx, user_id)
 
-        intervention = AI.generate_intervention(stuck_type)
-        # Save restart step for use after user clicks start
-        context.user_data["pending_intervention_step"] = {
-            "instruction": intervention["restart_step"].instruction,
-            "acceptance_criteria": intervention["restart_step"].acceptance_criteria,
-            "duration_min": intervention["restart_step"].duration_min,
-        }
 
-        await query.edit_message_text(
-            fmt_intervention_html(stuck_type, intervention),
+async def _generate_and_show_today(msg, ctx, user_id):
+    """Generate A/B candidates and auto-present A."""
+    goal = db.get_active_goal(user_id)
+    phase = None
+    phase_id = None
+
+    if goal:
+        phase = db.get_active_phase(goal["goal_id"])
+        if phase:
+            phase_id = phase["phase_id"]
+
+    user = db.get_user(user_id)
+    low_energy = bool(user.get("low_energy_mode", 0))
+
+    candidates = engine.choose_candidates(user_id, phase_id, low_energy)
+    ctx.user_data["candidates"] = candidates
+    ctx.user_data["phase_id"] = phase_id
+    ctx.user_data["goal_id"] = goal["goal_id"] if goal else None
+
+    chosen = candidates["B"] if low_energy else candidates["A"]
+    ctx.user_data["chosen_candidate"] = chosen
+
+    # Auto-lock A and generate micro step
+    mainline_id = db.create_mainline(
+        user_id=user_id,
+        title=chosen["title"],
+        source="auto_from_phase" if phase_id else "manual",
+        goal_id=goal["goal_id"] if goal else None,
+        phase_id=phase_id,
+        task_id_ref=chosen.get("task_id"),
+    )
+    ctx.user_data["current_mainline_id"] = mainline_id
+
+    # Mark task as in_progress
+    if chosen.get("task_id"):
+        db.update_task(chosen["task_id"], status="in_progress")
+
+    # Generate micro step via LLM
+    task_title = None
+    if chosen.get("task_id"):
+        # Get task title from candidates
+        pass
+    micro = llm.generate_micro_step(chosen["title"], task_title)
+    ms = micro["micro_step"]
+
+    step_id = db.create_step(
+        mainline_id=mainline_id,
+        kind="micro",
+        duration_min=ms["duration_min"],
+        instruction=ms["instruction"],
+        acceptance_criteria=ms["acceptance_criteria"],
+    )
+    ctx.user_data["current_step_id"] = step_id
+
+    # Generate if-then plan (async, save quietly)
+    if_then = llm.generate_if_then_plan(chosen["title"])
+    if if_then and "plan" in if_then:
+        plan = if_then["plan"]
+        db.save_if_then(user_id, plan.get("if_trigger", ""), plan.get("then_action", ""), plan.get("reward"))
+
+    # Show to user
+    buttons = [[("▶️ 开始 2 分钟", "timer_micro")]]
+    if not low_energy:
+        buttons.append([("🔄 换一个", "switch_B")])
+    buttons.append([("🔋 低能量模式", "low_energy")])
+
+    text = (
+        f"📌 <b>今日主线</b>：{chosen['title']}\n\n"
+        f"🔹 <b>2 分钟起步</b>\n\n"
+        f"{ms['instruction']}\n\n"
+        f"✅ {ms['acceptance_criteria']}"
+    )
+    await _send(msg, text, kb(buttons))
+
+
+async def _show_step(msg, mainline_title, step):
+    text = (
+        f"📌 <b>{mainline_title}</b>\n\n"
+        f"🔹 <b>{step['duration_min']} 分钟</b>\n\n"
+        f"{step['instruction']}\n\n"
+        f"✅ {step['acceptance_criteria']}"
+    )
+    await _send(msg, text, kb([
+        [("▶️ 开始 {0} 分钟".format(step['duration_min']), "timer_micro" if step['kind'] == 'micro' else "timer_upgrade")],
+    ]))
+
+
+# ═══════════════════════════════════════════
+# CALLBACK ROUTER
+# ═══════════════════════════════════════════
+
+async def callback_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    data = q.data
+    user_id = update.effective_user.id
+    db.ensure_user(user_id)
+
+    # ── Navigation ──
+    if data == "cmd_today":
+        return await cmd_today(update, ctx)
+    if data == "cmd_manage":
+        return await _show_manage(q.message, user_id)
+
+    # ── Today: switch to B ──
+    if data == "switch_B":
+        candidates = ctx.user_data.get("candidates", {})
+        b = candidates.get("B")
+        if not b:
+            await q.edit_message_text("没有备选方案，继续当前主线。")
+            return
+
+        # Re-lock with B
+        mainline_id = ctx.user_data.get("current_mainline_id")
+        if mainline_id:
+            # Update mainline title
+            conn = db.get_conn()
+            conn.execute("UPDATE mainlines SET title=? WHERE mainline_id=?", (b["title"], mainline_id))
+            conn.commit()
+            conn.close()
+
+        micro = llm.generate_micro_step(b["title"])
+        ms = micro["micro_step"]
+        step_id = db.create_step(
+            mainline_id=mainline_id,
+            kind="micro",
+            duration_min=ms["duration_min"],
+            instruction=ms["instruction"],
+            acceptance_criteria=ms["acceptance_criteria"],
+        )
+        ctx.user_data["current_step_id"] = step_id
+        ctx.user_data["chosen_candidate"] = b
+
+        text = (
+            f"📌 <b>已切换</b>：{b['title']}\n\n"
+            f"🔹 <b>2 分钟起步</b>\n\n"
+            f"{ms['instruction']}\n\n"
+            f"✅ {ms['acceptance_criteria']}"
+        )
+        await q.edit_message_text(text, parse_mode="HTML", reply_markup=kb([
+            [("▶️ 开始 2 分钟", "timer_micro")],
+        ]))
+        return
+
+    # ── Low energy mode ──
+    if data == "low_energy":
+        db.update_user(user_id, low_energy_mode=1)
+        await q.edit_message_text("🔋 低能量模式已开启。重新生成…", parse_mode="HTML")
+        await _generate_and_show_today(q.message, ctx, user_id)
+        return
+
+    if data == "today_fresh":
+        db.clear_deferred(user_id)
+        await _generate_and_show_today(q.message, ctx, user_id)
+        return
+
+    # ── Timer start (micro: 2min) ──
+    if data == "timer_micro":
+        step_id = ctx.user_data.get("current_step_id")
+        if step_id:
+            db.update_step(step_id, status="executing")
+        await q.edit_message_text(
+            "⏱ <b>2 分钟开始！</b>\n\n做完点「完成」，卡住点「卡住」。",
             parse_mode="HTML",
-            reply_markup=kb([[("⏱ 开始 2 分钟 →", "intervention_go")]]),
+            reply_markup=kb([
+                [("✅ 完成了", "step_done_micro")],
+                [("🧱 卡住了", "step_stuck"), ("↩️ 缩小", "step_shrink")],
+                [("🚪 退出（明天继续）", "step_exit")],
+            ]),
         )
         return
 
-    if data == "stuck_cancel":
-        session.fsm = FSM.EXECUTING
-        save_session(context, session)
-        step = session.current_step or {}
-        await query.edit_message_text(
-            fmt_step_card_html(step, session.mainline_title) + "\n\n⏱ 继续执行中…",
+    # ── Timer start (upgrade: 8min) ──
+    if data == "timer_upgrade":
+        step_id = ctx.user_data.get("current_step_id")
+        if step_id:
+            db.update_step(step_id, status="executing")
+        await q.edit_message_text(
+            "⏱ <b>8 分钟继续！</b>\n\n你已经启动了，保持这个势头。",
             parse_mode="HTML",
-            reply_markup=executing_kb(),
+            reply_markup=kb([
+                [("✅ 完成了", "step_done_upgrade")],
+                [("🧱 卡住了", "step_stuck"), ("↩️ 缩小", "step_shrink")],
+                [("🚪 退出（明天继续）", "step_exit")],
+            ]),
         )
         return
 
-    # ── Intervention go ──
-    if data == "intervention_go":
-        pending = context.user_data.get("pending_intervention_step")
-        if pending:
-            session.current_step = pending
-        session.fsm = FSM.EXECUTING
-        save_session(context, session)
-        step = session.current_step or {}
-        await query.edit_message_text(
-            f"⏱ <b>2 分钟起步！</b>\n\n"
-            f"{step.get('instruction', '')}\n\n"
-            f"✅ {step.get('acceptance_criteria', '')}",
+    # ── Step done (micro) → offer upgrade ──
+    if data == "step_done_micro":
+        step_id = ctx.user_data.get("current_step_id")
+        if step_id:
+            db.update_step(step_id, status="done")
+
+        mainline_id = ctx.user_data.get("current_mainline_id")
+        mainline = None
+        if mainline_id:
+            conn = db.get_conn()
+            row = conn.execute("SELECT * FROM mainlines WHERE mainline_id=?", (mainline_id,)).fetchone()
+            conn.close()
+            mainline = dict(row) if row else None
+
+        # Generate upgrade step
+        title = mainline["title"] if mainline else "任务"
+        upgrade = llm.generate_upgrade_step(title)
+        us = upgrade["step"]
+
+        upgrade_step_id = db.create_step(
+            mainline_id=mainline_id,
+            kind="upgrade",
+            duration_min=us["duration_min"],
+            instruction=us["instruction"],
+            acceptance_criteria=us["acceptance_criteria"],
+            difficulty=us.get("difficulty", 1),
+        )
+        ctx.user_data["current_step_id"] = upgrade_step_id
+
+        await q.edit_message_text(
+            f"✅ <b>2 分钟完成！</b>\n\n"
+            f"🔥 继续 8 分钟吗？\n\n"
+            f"{us['instruction']}\n\n"
+            f"✅ {us['acceptance_criteria']}\n\n"
+            f"<i>结束也算赢，你已经推进了一步。</i>",
             parse_mode="HTML",
-            reply_markup=executing_kb(),
+            reply_markup=kb([
+                [("🔥 继续 8 分钟", "timer_upgrade")],
+                [("🌙 结束（也算赢）", "review_start")],
+            ]),
+        )
+        return
+
+    # ── Step done (upgrade) → review ──
+    if data == "step_done_upgrade":
+        step_id = ctx.user_data.get("current_step_id")
+        if step_id:
+            db.update_step(step_id, status="done")
+        await _start_review(q, ctx, user_id)
+        return
+
+    # ── Review start ──
+    if data == "review_start":
+        await _start_review(q, ctx, user_id)
+        return
+
+    # ── Step stuck ──
+    if data == "step_stuck":
+        await q.edit_message_text(
+            "先给情绪取个名字：",
+            reply_markup=kb([
+                [("😤 烦躁", "emo_烦躁"), ("😰 焦虑", "emo_焦虑")],
+                [("😩 疲惫", "emo_疲惫"), ("😶 麻木", "emo_麻木")],
+                [("😔 沮丧", "emo_沮丧"), ("🤷 不知道", "emo_不知道")],
+            ]),
+        )
+        return
+
+    # ── Emotion selected → stuck type ──
+    if data.startswith("emo_"):
+        emotion = data.replace("emo_", "")
+        ctx.user_data["emotion_label"] = emotion
+        await q.edit_message_text(
+            f"情绪：<b>{emotion}</b>\n\n什么卡住了你？",
+            parse_mode="HTML",
+            reply_markup=kb([
+                [("✨ 完美主义", "stuck_PERFECTIONISM")],
+                [("🏔 目标太大", "stuck_GOAL_TOO_BIG")],
+                [("🌀 想太多", "stuck_OVERTHINKING")],
+                [("😶‍🌫️ 情绪内耗", "stuck_EMOTIONAL_FRICTION")],
+                [("📱 想刷手机", "stuck_REWARD_MISMATCH")],
+                [("🔒 觉得不行", "stuck_SELF_LIMITING")],
+            ]),
+        )
+        return
+
+    # ── Stuck type selected → intervention ──
+    if data.startswith("stuck_"):
+        stuck_type = data.replace("stuck_", "")
+        emotion = ctx.user_data.get("emotion_label", "")
+        step_id = ctx.user_data.get("current_step_id")
+        step = db.get_step(step_id) if step_id else None
+
+        mainline_id = ctx.user_data.get("current_mainline_id")
+        mainline = None
+        if mainline_id:
+            conn = db.get_conn()
+            row = conn.execute("SELECT * FROM mainlines WHERE mainline_id=?", (mainline_id,)).fetchone()
+            conn.close()
+            mainline = dict(row) if row else None
+
+        # Get recent evidence for SELF_LIMITING
+        recent_evidence = None
+        if stuck_type == "SELF_LIMITING":
+            evs = db.list_evidence(user_id, limit=5)
+            recent_evidence = [e["counter_evidence"] for e in evs] if evs else None
+
+        # Record stuck event
+        if step_id:
+            db.create_stuck_event(step_id, stuck_type, emotion)
+
+        # Generate intervention
+        iv = llm.generate_intervention(
+            stuck_type=stuck_type,
+            emotion_label=emotion,
+            mainline_title=mainline["title"] if mainline else None,
+            step_instruction=step["instruction"] if step else None,
+            recent_evidence=recent_evidence,
+        )
+
+        # Build message
+        lines = [
+            f"💬 <b>{iv.get('intervention_text', '')}</b>\n",
+            f"🫁 <i>{iv.get('body_reset', '深呼吸3次。')}</i>\n",
+        ]
+        if iv.get("evidence_quotes"):
+            lines.append("📋 <b>你的证据：</b>")
+            for eq in iv["evidence_quotes"]:
+                lines.append(f"  · {eq}")
+            lines.append("")
+
+        rs = iv.get("restart_step", {})
+        lines.append(f"🔸 <b>起步动作</b>（{rs.get('duration_min', 2)} 分钟）\n")
+        lines.append(f"{rs.get('instruction', '')}\n")
+        lines.append(f"✅ {rs.get('acceptance_criteria', '')}\n")
+        lines.append(f"\n💬 <i>{iv.get('push_line', '回到计时器 →')}</i>")
+
+        # Save restart step
+        if mainline_id:
+            restart_step_id = db.create_step(
+                mainline_id=mainline_id,
+                kind="micro",
+                duration_min=rs.get("duration_min", 2),
+                instruction=rs.get("instruction", "做一个最小动作"),
+                acceptance_criteria=rs.get("acceptance_criteria", "动了就行"),
+            )
+            ctx.user_data["current_step_id"] = restart_step_id
+
+        await q.edit_message_text(
+            "\n".join(lines),
+            parse_mode="HTML",
+            reply_markup=kb([
+                [("▶️ 开始 2 分钟", "timer_micro")],
+            ]),
         )
         return
 
     # ── Shrink step ──
     if data == "step_shrink":
-        micro = AI.shrink_step(session.current_step)
-        session.current_step = {
-            "instruction": micro.instruction,
-            "acceptance_criteria": micro.acceptance_criteria,
-            "duration_min": micro.duration_min,
-        }
-        session.fsm = FSM.EXECUTING
-        save_session(context, session)
-        await query.edit_message_text(
+        step_id = ctx.user_data.get("current_step_id")
+        step = db.get_step(step_id) if step_id else None
+        mainline_id = ctx.user_data.get("current_mainline_id")
+
+        instruction = step["instruction"] if step else "做一个最小动作"
+        first_action = instruction.split("，")[0] if "，" in instruction else instruction.split("。")[0]
+
+        if mainline_id:
+            shrink_id = db.create_step(
+                mainline_id=mainline_id,
+                kind="micro",
+                duration_min=2,
+                instruction=f"只做一件事：{first_action}。做完就算赢。",
+                acceptance_criteria="完成了这一个动作",
+            )
+            ctx.user_data["current_step_id"] = shrink_id
+
+        await q.edit_message_text(
             f"↩️ <b>缩小到 2 分钟</b>\n\n"
-            f"{micro.instruction}\n\n"
-            f"✅ {micro.acceptance_criteria}",
+            f"只做一件事：{first_action}\n\n"
+            f"✅ 做完就算赢",
             parse_mode="HTML",
-            reply_markup=executing_kb(),
-        )
-        return
-
-    # ── Review tags ──
-    if data.startswith("tag_"):
-        tag_value = data.replace("tag_", "")
-        if tag_value != "skip" and session.evidence:
-            session.evidence[-1]["tags"].append(tag_value)
-        save_session(context, session)
-        await query.edit_message_text(
-            fmt_review_html(session).replace("今天卡在哪了？（可选，帮助识别模式）", ""),
-            parse_mode="HTML",
-            reply_markup=review_kb(),
-        )
-        return
-
-    # ── Review actions ──
-    if data == "review_continue":
-        session.fsm = FSM.MAINLINE_LOCKED
-        save_session(context, session)
-        await _generate_and_show_step(query, context, session)
-        return
-
-    if data == "review_end":
-        session.fsm = FSM.SESSION_END
-        save_session(context, session)
-        await query.edit_message_text(
-            fmt_session_end_html(session),
-            parse_mode="HTML",
-            reply_markup=restart_kb(),
-        )
-        return
-
-    # ── Restart ──
-    if data == "restart":
-        session.fsm = FSM.NO_MAINLINE
-        session.mainline_title = None
-        session.current_step = None
-        session.stuck_events = []
-        save_session(context, session)
-        await query.edit_message_text(
-            "🎯 <b>新 Session</b>\n\n今天只做一件事。",
-            parse_mode="HTML",
-            reply_markup=main_menu_kb(),
-        )
-        return
-
-    # ── Course status toggles ──
-    if data.startswith("course_toggle_"):
-        idx = int(data.replace("course_toggle_", ""))
-        if idx < len(session.courses):
-            c = session.courses[idx]
-            cycle = {"not_started": "in_progress", "in_progress": "completed", "completed": "not_started"}
-            c["status"] = cycle.get(c["status"], "not_started")
-            save_session(context, session)
-        await _show_courses_editor(query, context, session)
-        return
-
-    if data == "courses_done":
-        # Generate candidates
-        courses = [Course(**c) for c in session.courses]
-        candidates = AI.generate_candidates(courses)
-        context.user_data["candidates"] = candidates
-        session.fsm = FSM.CANDIDATES
-        save_session(context, session)
-
-        text = (
-            f"🧭 <b>{session.longline_goal}</b>\n\n"
-            f"🅰️ <b>{candidates['A']['title']}</b>\n"
-            f"   <i>{candidates['A']['reason']}</i>\n\n"
-            f"🅱️ <b>{candidates['B']['title']}</b>\n"
-            f"   <i>{candidates['B']['reason']}</i>"
-        )
-        await query.edit_message_text(text, parse_mode="HTML", reply_markup=candidate_kb())
-        return
-
-    if data == "course_add":
-        await query.edit_message_text(
-            "📚 发送课程名称（一行一个）来添加更多课程：",
-            parse_mode="HTML",
-        )
-        session.fsm = "ADDING_COURSES"
-        save_session(context, session)
-        return
-
-
-# ── Helper: generate step and show ──
-
-async def _generate_and_show_step(query, context, session):
-    step = AI.generate_step(session.mainline_title or "任务", session.time_budget)
-    session.current_step = {
-        "instruction": step.instruction,
-        "acceptance_criteria": step.acceptance_criteria,
-        "duration_min": step.duration_min,
-    }
-    session.fsm = FSM.NEXT_STEP_READY
-    save_session(context, session)
-
-    await query.edit_message_text(
-        fmt_step_card_html(session.current_step, session.mainline_title),
-        parse_mode="HTML",
-        reply_markup=step_ready_kb(step.duration_min),
-    )
-
-
-async def _show_courses_editor(query, context, session):
-    status_icons = {"not_started": "⬜", "in_progress": "🟡", "completed": "✅"}
-    rows = []
-    for i, c in enumerate(session.courses):
-        icon = status_icons.get(c.get("status", "not_started"), "⬜")
-        rows.append([(f"{icon} {c['name']}", f"course_toggle_{i}")])
-    rows.append([("➕ 添加课程", "course_add"), ("✅ 完成设置", "courses_done")])
-    await query.edit_message_text(
-        "📚 <b>课程清单</b>（点击切换状态）\n"
-        "⬜ 未开始 → 🟡 进行中 → ✅ 已完成",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton(text=t, callback_data=d) for t, d in row]
-            for row in rows
-        ]),
-    )
-
-
-# ── Text Message Handler (context-dependent) ──
-
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle free text input based on current FSM state."""
-    session = get_session(context)
-    text = update.message.text.strip()
-
-    # ── Longline setup: receiving goal title ──
-    if session.fsm == "LONGLINE_SETUP":
-        session.longline_goal = text
-        session.courses = []
-        session.fsm = "LONGLINE_COURSES"
-        save_session(context, session)
-        await update.message.reply_text(
-            f"🧭 目标已设置：<b>{text}</b>\n\n"
-            "现在发送你的课程清单（一行一个），例如：\n"
-            "<i>C779 Web Development\n"
-            "C867 Scripting and Programming\n"
-            "D322 Cloud Computing</i>",
-            parse_mode="HTML",
-        )
-        return
-
-    # ── Receiving courses list ──
-    if session.fsm in ("LONGLINE_COURSES", "ADDING_COURSES"):
-        new_courses = [line.strip() for line in text.split("\n") if line.strip()]
-        for name in new_courses:
-            session.courses.append({"name": name, "status": "not_started"})
-        save_session(context, session)
-        # Show course editor
-        status_icons = {"not_started": "⬜", "in_progress": "🟡", "completed": "✅"}
-        rows = []
-        for i, c in enumerate(session.courses):
-            icon = status_icons.get(c.get("status", "not_started"), "⬜")
-            rows.append([(f"{icon} {c['name']}", f"course_toggle_{i}")])
-        rows.append([("➕ 添加课程", "course_add"), ("✅ 完成设置", "courses_done")])
-        await update.message.reply_text(
-            f"📚 已添加 {len(new_courses)} 门课程（点击切换状态）\n"
-            "⬜ 未开始 → 🟡 进行中 → ✅ 已完成",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(text=t, callback_data=d) for t, d in row]
-                for row in rows
+            reply_markup=kb([
+                [("▶️ 开始 2 分钟", "timer_micro")],
             ]),
         )
         return
 
-    # ── Manual mainline input ──
-    if session.fsm == FSM.NO_MAINLINE:
-        # Check for big goal interception (R6)
-        if AI.is_big_goal(text):
-            session.mainline_title = text
-            session.fsm = FSM.CLARIFY
-            save_session(context, session)
-            await update.message.reply_text(
-                f"⚡ 「{text[:20]}…」太大了，我们缩小到今天能验收的一步。\n\n"
-                "先告诉我：今天能投入多久？",
-                parse_mode="HTML",
-                reply_markup=time_budget_kb(),
-            )
+    # ── Exit (defer) ──
+    if data == "step_exit":
+        step_id = ctx.user_data.get("current_step_id")
+        mainline_id = ctx.user_data.get("current_mainline_id")
+        if step_id:
+            db.update_step(step_id, status="deferred")
+            db.create_deferred(user_id, step_id, mainline_id, reason="exit")
+
+        await q.edit_message_text(
+            "🌙 <b>没关系，明天继续。</b>\n\n"
+            "下次 /today 会自动帮你接上今天的位置。\n"
+            "退出不是失败，是暂停。",
+            parse_mode="HTML",
+            reply_markup=kb([
+                [("🎯 回到主菜单", "cmd_start_fresh")],
+            ]),
+        )
+        return
+
+    if data == "cmd_start_fresh":
+        await q.edit_message_text(
+            "🎯 随时发 /today 继续推进。",
+            parse_mode="HTML",
+        )
+        return
+
+    # ── Review: stuck tag (optional) ──
+    if data.startswith("review_tag_"):
+        tag = data.replace("review_tag_", "")
+        ctx.user_data["review_stuck_tag"] = tag
+        await _finish_review(q, ctx, user_id)
+        return
+
+    if data == "review_skip_tag":
+        await _finish_review(q, ctx, user_id)
+        return
+
+    # ── Manage callbacks ──
+    if data == "manage_goal":
+        return await _show_goal_menu(q.message, user_id, edit=True)
+    if data == "manage_phases":
+        return await _show_phases_menu(q.message, user_id)
+    if data == "manage_tasks":
+        return await _show_tasks_menu(q, ctx, user_id)
+
+    # ── Goal creation flow ──
+    if data == "goal_create":
+        ctx.user_data["awaiting"] = "goal_title"
+        await q.edit_message_text("📝 发送你的目标（一句话）：\n\n例如：<i>180天拿到WGU CS学位</i>", parse_mode="HTML")
+        return
+
+    # ── Phase creation ──
+    if data == "phase_create":
+        ctx.user_data["awaiting"] = "phase_title"
+        goal = db.get_active_goal(user_id)
+        ctx.user_data["target_goal_id"] = goal["goal_id"] if goal else None
+        await q.edit_message_text("📝 发送阶段名称：\n\n例如：<i>Sophia先修阶段</i>", parse_mode="HTML")
+        return
+
+    if data.startswith("phase_activate_"):
+        phase_id = int(data.replace("phase_activate_", ""))
+        goal = db.get_active_goal(user_id)
+        if goal:
+            db.set_active_phase(goal["goal_id"], phase_id)
+        await q.edit_message_text("✅ 阶段已激活。", parse_mode="HTML")
+        return
+
+    # ── Task management ──
+    if data == "tasks_add":
+        ctx.user_data["awaiting"] = "task_title"
+        await q.edit_message_text("📝 发送任务标题：", parse_mode="HTML")
+        return
+
+    if data == "tasks_import":
+        ctx.user_data["awaiting"] = "import_paste"
+        await q.edit_message_text(
+            "📋 <b>粘贴任务清单</b>（一行一个）\n\n"
+            "格式：<code>任务名 - 状态 - tags:标签1,标签2</code>\n\n"
+            "例如：\n"
+            "<code>C960 Discrete Math - in_progress - tags:wgu,math\n"
+            "C867 Scripting - not_started - tags:wgu</code>\n\n"
+            "状态和标签可选，默认 not_started。",
+            parse_mode="HTML",
+        )
+        return
+
+    if data.startswith("import_confirm_"):
+        import_id = int(data.replace("import_confirm_", ""))
+        db.confirm_import(import_id)
+        draft = db.get_import_draft(import_id)
+        count = len(draft["parsed_items"]) if draft else 0
+        await q.edit_message_text(f"✅ 已导入 {count} 个任务！\n\n发 /today 开始推进。", parse_mode="HTML")
+        return
+
+    if data.startswith("import_discard_"):
+        import_id = int(data.replace("import_discard_", ""))
+        db.discard_import(import_id)
+        await q.edit_message_text("🗑 已丢弃导入。", parse_mode="HTML")
+        return
+
+    if data.startswith("task_toggle_"):
+        task_id = int(data.replace("task_toggle_", ""))
+        conn = db.get_conn()
+        row = conn.execute("SELECT status FROM task_items WHERE task_id=?", (task_id,)).fetchone()
+        conn.close()
+        if row:
+            cycle = {"not_started": "in_progress", "in_progress": "completed", "completed": "not_started", "dropped": "not_started"}
+            new_status = cycle.get(row["status"], "not_started")
+            db.update_task(task_id, status=new_status)
+        return await _show_tasks_menu(q, ctx, user_id)
+
+    if data.startswith("task_delete_"):
+        task_id = int(data.replace("task_delete_", ""))
+        db.delete_task(task_id)
+        return await _show_tasks_menu(q, ctx, user_id)
+
+    if data == "tasks_back":
+        return await _show_manage(q.message, user_id, edit=True)
+
+
+# ═══════════════════════════════════════════
+# REVIEW FLOW
+# ═══════════════════════════════════════════
+
+async def _start_review(q, ctx, user_id):
+    await q.edit_message_text(
+        "✅ <b>推进了一步！</b>\n\n"
+        "今天卡在哪了？（可选）",
+        parse_mode="HTML",
+        reply_markup=kb([
+            [("✨ 完美主义", "review_tag_PERFECTIONISM"), ("🌀 想太多", "review_tag_OVERTHINKING")],
+            [("📱 想刷手机", "review_tag_REWARD_MISMATCH"), ("🔒 觉得不行", "review_tag_SELF_LIMITING")],
+            [("跳过", "review_skip_tag")],
+        ]),
+    )
+
+
+async def _finish_review(q, ctx, user_id):
+    mainline_id = ctx.user_data.get("current_mainline_id")
+    mainline = None
+    if mainline_id:
+        conn = db.get_conn()
+        row = conn.execute("SELECT * FROM mainlines WHERE mainline_id=?", (mainline_id,)).fetchone()
+        conn.close()
+        mainline = dict(row) if row else None
+
+    step_id = ctx.user_data.get("current_step_id")
+    step = db.get_step(step_id) if step_id else None
+
+    # Build evidence
+    evidence_text = f"完成了：{mainline['title'] if mainline else '任务'}"
+    if step:
+        evidence_text += f" → {step['instruction'][:40]}…"
+
+    tags = ["small_win"]
+    stuck_tag = ctx.user_data.get("review_stuck_tag")
+    if stuck_tag:
+        tags.append(stuck_tag)
+
+    db.create_evidence(user_id, evidence_text, tags)
+    streak = db.update_streak(user_id)
+
+    # Count total evidence
+    all_evidence = db.list_evidence(user_id, limit=100)
+
+    await q.edit_message_text(
+        f"📋 <b>证据已记录</b>\n\n"
+        f"「{evidence_text}」\n\n"
+        f"🔥 连续推进 <b>{streak}</b> 天\n"
+        f"📋 证据库共 <b>{len(all_evidence)}</b> 条\n\n"
+        f"每一步都是证据。",
+        parse_mode="HTML",
+        reply_markup=kb([
+            [("🎯 继续下一步", "cmd_today")],
+            [("🌙 今天结束", "session_end")],
+        ]),
+    )
+    return
+
+
+# ═══════════════════════════════════════════
+# /manage — 管理入口
+# ═══════════════════════════════════════════
+
+async def cmd_manage(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    db.ensure_user(user_id)
+    msg = update.message or update.callback_query.message
+    if update.callback_query:
+        await update.callback_query.answer()
+    await _show_manage(msg, user_id)
+
+
+async def _show_manage(msg, user_id, edit=False):
+    goal = db.get_active_goal(user_id)
+    phase = None
+    task_count = 0
+
+    status_lines = ["⚙️ <b>管理中心</b>\n"]
+    if goal:
+        status_lines.append(f"🧭 目标：{goal['title']}")
+        phase = db.get_active_phase(goal["goal_id"])
+        if phase:
+            status_lines.append(f"📂 当前阶段：{phase['title']}")
+            tasks = db.list_tasks(phase["phase_id"])
+            task_count = len(tasks)
+            completed = sum(1 for t in tasks if t["status"] == "completed")
+            status_lines.append(f"📋 任务：{completed}/{task_count} 完成")
+    else:
+        status_lines.append("还没有设置目标。")
+
+    user = db.get_user(user_id)
+    status_lines.append(f"\n🔥 连续推进：{user['streak_days']} 天")
+
+    text = "\n".join(status_lines)
+    markup = kb([
+        [("🧭 目标", "manage_goal"), ("📂 阶段", "manage_phases")],
+        [("📋 任务", "manage_tasks")],
+        [("▶️ 回到 /today", "cmd_today")],
+    ])
+
+    if edit:
+        await msg.edit_text(text, parse_mode="HTML", reply_markup=markup)
+    else:
+        await msg.reply_text(text, parse_mode="HTML", reply_markup=markup)
+
+
+# ── Goal menu ──
+
+async def _show_goal_menu(msg, user_id, edit=False):
+    goal = db.get_active_goal(user_id)
+    if goal:
+        text = f"🧭 <b>当前目标</b>：{goal['title']}"
+        if goal.get("deadline_date"):
+            text += f"\n📅 截止：{goal['deadline_date']}"
+        markup = kb([
+            [("✏️ 创建新目标", "goal_create")],
+            [("← 返回", "cmd_manage")],
+        ])
+    else:
+        text = "🧭 还没有目标。\n\n设一个长线目标（可选），系统会帮你拆解每天的推进点。"
+        markup = kb([
+            [("➕ 创建目标", "goal_create")],
+            [("← 返回", "cmd_manage")],
+        ])
+
+    if edit:
+        await msg.edit_text(text, parse_mode="HTML", reply_markup=markup)
+    else:
+        await msg.reply_text(text, parse_mode="HTML", reply_markup=markup)
+
+
+# ── Phases menu ──
+
+async def _show_phases_menu(msg, user_id):
+    goal = db.get_active_goal(user_id)
+    if not goal:
+        await msg.edit_text("先创建一个目标。", reply_markup=kb([[("🧭 创建目标", "goal_create")]]))
+        return
+
+    phases = db.list_phases(goal["goal_id"])
+    if not phases:
+        await msg.edit_text(
+            "📂 还没有阶段。\n\n阶段用来分段推进目标（例如：先修阶段 → 核心课程 → 冲刺）",
+            parse_mode="HTML",
+            reply_markup=kb([
+                [("➕ 创建阶段", "phase_create")],
+                [("← 返回", "cmd_manage")],
+            ]),
+        )
+        return
+
+    lines = ["📂 <b>阶段列表</b>\n"]
+    buttons = []
+    for p in phases:
+        icon = "🟢" if p["is_active"] else "⚪"
+        lines.append(f"{icon} {p['title']}")
+        if not p["is_active"]:
+            buttons.append([(f"激活「{p['title'][:15]}」", f"phase_activate_{p['phase_id']}")])
+
+    buttons.append([("➕ 新阶段", "phase_create")])
+    buttons.append([("← 返回", "cmd_manage")])
+
+    await msg.edit_text("\n".join(lines), parse_mode="HTML", reply_markup=kb(buttons))
+
+
+# ── Tasks menu ──
+
+async def _show_tasks_menu(q_or_msg, ctx, user_id):
+    goal = db.get_active_goal(user_id)
+    phase = None
+    if goal:
+        phase = db.get_active_phase(goal["goal_id"])
+
+    if not phase:
+        msg = q_or_msg.message if hasattr(q_or_msg, 'message') else q_or_msg
+        text = "📋 先创建目标和阶段才能管理任务。"
+        try:
+            await msg.edit_text(text, reply_markup=kb([[("🧭 创建目标", "goal_create"), ("← 返回", "cmd_manage")]]))
+        except:
+            await msg.reply_text(text, reply_markup=kb([[("🧭 创建目标", "goal_create"), ("← 返回", "cmd_manage")]]))
+        return
+
+    tasks = db.list_tasks(phase["phase_id"])
+    status_icons = {"not_started": "⬜", "in_progress": "🟡", "completed": "✅", "dropped": "🗑"}
+
+    lines = [f"📋 <b>任务列表</b>（{phase['title']}）\n"]
+    lines.append("点击切换状态：⬜→🟡→✅\n")
+
+    buttons = []
+    for t in tasks[:20]:
+        icon = status_icons.get(t["status"], "⬜")
+        buttons.append([(f"{icon} {t['title'][:30]}", f"task_toggle_{t['task_id']}")])
+
+    buttons.append([("➕ 添加任务", "tasks_add"), ("📋 批量导入", "tasks_import")])
+    buttons.append([("← 返回", "tasks_back")])
+
+    if not tasks:
+        lines.append("还没有任务。添加任务或批量导入。")
+
+    msg = q_or_msg.message if hasattr(q_or_msg, 'message') else q_or_msg
+    try:
+        await msg.edit_text("\n".join(lines), parse_mode="HTML", reply_markup=kb(buttons))
+    except:
+        await msg.reply_text("\n".join(lines), parse_mode="HTML", reply_markup=kb(buttons))
+
+
+# ═══════════════════════════════════════════
+# TEXT MESSAGE HANDLER
+# ═══════════════════════════════════════════
+
+async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
+    awaiting = ctx.user_data.get("awaiting")
+    db.ensure_user(user_id)
+
+    # ── Goal creation ──
+    if awaiting == "goal_title":
+        ctx.user_data["awaiting"] = None
+        goal_id = db.create_goal(user_id, text)
+        # Auto-create default phase
+        phase_id = db.create_phase(goal_id, "默认阶段", is_active=1)
+        ctx.user_data["target_phase_id"] = phase_id
+
+        await update.message.reply_text(
+            f"✅ 目标已创建：<b>{text}</b>\n\n"
+            f"已自动创建「默认阶段」。\n"
+            f"现在可以添加任务，或发 /today 开始推进。",
+            parse_mode="HTML",
+            reply_markup=kb([
+                [("📋 添加任务", "manage_tasks")],
+                [("▶️ 直接开始 /today", "cmd_today")],
+            ]),
+        )
+        return
+
+    # ── Phase creation ──
+    if awaiting == "phase_title":
+        ctx.user_data["awaiting"] = None
+        goal_id = ctx.user_data.get("target_goal_id")
+        if not goal_id:
+            goal = db.get_active_goal(user_id)
+            goal_id = goal["goal_id"] if goal else None
+        if goal_id:
+            db.create_phase(goal_id, text, is_active=1)
+            await update.message.reply_text(f"✅ 阶段「{text}」已创建并激活。", parse_mode="HTML",
+                reply_markup=kb([[("📋 管理任务", "manage_tasks"), ("← 返回", "cmd_manage")]]))
+        return
+
+    # ── Task creation ──
+    if awaiting == "task_title":
+        ctx.user_data["awaiting"] = None
+        goal = db.get_active_goal(user_id)
+        phase = db.get_active_phase(goal["goal_id"]) if goal else None
+        if phase:
+            db.create_task(phase["phase_id"], text)
+            await update.message.reply_text(f"✅ 任务已添加：{text}", parse_mode="HTML",
+                reply_markup=kb([[("➕ 继续添加", "tasks_add"), ("📋 查看任务", "manage_tasks")]]))
+        else:
+            await update.message.reply_text("先创建目标和阶段。", reply_markup=kb([[("🧭 创建目标", "goal_create")]]))
+        return
+
+    # ── Import paste ──
+    if awaiting == "import_paste":
+        ctx.user_data["awaiting"] = None
+        goal = db.get_active_goal(user_id)
+        phase = db.get_active_phase(goal["goal_id"]) if goal else None
+        if not phase:
+            await update.message.reply_text("先创建目标和阶段。")
             return
 
-        # Normal mainline
-        session.mainline_title = text
-        session.fsm = FSM.MAINLINE_LOCKED
-        save_session(context, session)
+        parsed = engine.parse_import_text(text)
+        if not parsed:
+            await update.message.reply_text("没有解析到任务。请检查格式后重试。")
+            return
 
-        step = AI.generate_step(text, session.time_budget)
-        session.current_step = {
-            "instruction": step.instruction,
-            "acceptance_criteria": step.acceptance_criteria,
-            "duration_min": step.duration_min,
-        }
-        session.fsm = FSM.NEXT_STEP_READY
-        save_session(context, session)
+        import_id = db.create_import_draft(user_id, phase["phase_id"], text, parsed, "paste")
+
+        # Show preview
+        status_icons = {"not_started": "⬜", "in_progress": "🟡", "completed": "✅"}
+        lines = [f"📋 <b>导入预览</b>（{len(parsed)} 个任务）\n"]
+        for i, item in enumerate(parsed[:20]):
+            icon = status_icons.get(item.get("status", "not_started"), "⬜")
+            tags = ", ".join(item.get("tags", []))
+            tag_str = f" [{tags}]" if tags else ""
+            lines.append(f"{i+1}. {icon} {item['title']}{tag_str}")
+
+        lines.append("\n确认导入？")
 
         await update.message.reply_text(
-            f"🔒 <b>已锁定</b>：{text}\n\n" + fmt_step_card_html(session.current_step),
+            "\n".join(lines),
             parse_mode="HTML",
-            reply_markup=step_ready_kb(step.duration_min),
+            reply_markup=kb([
+                [("✅ 确认导入", f"import_confirm_{import_id}")],
+                [("🗑 丢弃", f"import_discard_{import_id}")],
+            ]),
         )
         return
 
-    # ── Fallback: during execution, treat text as note ──
-    if session.fsm in (FSM.EXECUTING, FSM.NEXT_STEP_READY):
+    # ── Default: treat as manual mainline (no goal/phase scenario) ──
+    if engine.is_big_goal(text):
         await update.message.reply_text(
-            "📝 已记录。继续执行当前步骤 →",
-            reply_markup=executing_kb(),
+            f"⚡ 「{text[:20]}…」太大了。\n\n"
+            "建议先用 /manage → 创建目标 → 添加任务，\n"
+            "然后 /today 会自动帮你拆成每天的小步。",
+            parse_mode="HTML",
+            reply_markup=kb([
+                [("⚙️ 去管理", "cmd_manage")],
+                [("▶️ 直接开始", "cmd_today")],
+            ]),
         )
         return
 
-    # ── Default ──
+    # Quick manual mainline
+    mainline_id = db.create_mainline(user_id, text)
+    micro = llm.generate_micro_step(text)
+    ms = micro["micro_step"]
+    step_id = db.create_step(mainline_id, "micro", ms["duration_min"], ms["instruction"], ms["acceptance_criteria"])
+    ctx.user_data["current_mainline_id"] = mainline_id
+    ctx.user_data["current_step_id"] = step_id
+
     await update.message.reply_text(
-        "发送 /start 开始新的 session，或 /reset 重置当前 session。",
+        f"🔒 <b>已锁定</b>：{text}\n\n"
+        f"🔹 <b>2 分钟起步</b>\n\n"
+        f"{ms['instruction']}\n\n"
+        f"✅ {ms['acceptance_criteria']}",
+        parse_mode="HTML",
+        reply_markup=kb([[("▶️ 开始 2 分钟", "timer_micro")]]),
     )
+
+
+# ═══════════════════════════════════════════
+# COMMANDS: /evidence /status
+# ═══════════════════════════════════════════
+
+async def cmd_evidence(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    evs = db.list_evidence(user_id, limit=10)
+    if not evs:
+        await update.message.reply_text("📋 证据库还是空的。发 /today 完成第一步。")
+        return
+    user = db.get_user(user_id)
+    lines = [f"📋 <b>证据库</b>（共 {len(evs)} 条）\n"]
+    for ev in evs:
+        lines.append(f"  · {ev['counter_evidence'][:60]}")
+    lines.append(f"\n🔥 连续推进 <b>{user['streak_days']}</b> 天")
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user = db.get_user(user_id)
+    goal = db.get_active_goal(user_id)
+    lines = ["📊 <b>状态</b>\n"]
+    if goal:
+        lines.append(f"🧭 目标：{goal['title']}")
+        phase = db.get_active_phase(goal["goal_id"])
+        if phase:
+            lines.append(f"📂 阶段：{phase['title']}")
+            tasks = db.list_tasks(phase["phase_id"])
+            c = sum(1 for t in tasks if t["status"] == "completed")
+            lines.append(f"📋 任务：{c}/{len(tasks)}")
+    lines.append(f"🔥 连续：{user['streak_days']} 天")
+    deferred = db.get_deferred(user_id)
+    if deferred:
+        lines.append(f"⏸ 有未完成步骤待继续")
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+# ═══════════════════════════════════════════
+# HELPER
+# ═══════════════════════════════════════════
+
+async def _send(msg, text, markup):
+    """Send or edit message."""
+    try:
+        await msg.edit_text(text, parse_mode="HTML", reply_markup=markup)
+    except:
+        await msg.reply_text(text, parse_mode="HTML", reply_markup=markup)
 
 
 # ═══════════════════════════════════════════
@@ -962,32 +985,36 @@ def main():
     if not token:
         print("=" * 50)
         print("ERROR: 请设置环境变量 TELEGRAM_BOT_TOKEN")
-        print()
-        print("步骤：")
-        print("1. 在 Telegram 找 @BotFather")
-        print("2. 发送 /newbot 创建机器人")
-        print("3. 复制 token")
-        print("4. 运行：")
-        print("   export TELEGRAM_BOT_TOKEN='你的token'")
-        print("   python bot.py")
         print("=" * 50)
         return
+
+    # Init database
+    db.init_db()
+    logger.info("Database initialized")
+
+    # Check OpenAI key
+    openai_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    if openai_key:
+        logger.info("OpenAI API key found, LLM features enabled")
+    else:
+        logger.warning("OPENAI_API_KEY not set, using fallback responses")
 
     app = Application.builder().token(token).build()
 
     # Commands
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("reset", cmd_reset))
+    app.add_handler(CommandHandler("today", cmd_today))
+    app.add_handler(CommandHandler("manage", cmd_manage))
     app.add_handler(CommandHandler("evidence", cmd_evidence))
     app.add_handler(CommandHandler("status", cmd_status))
 
-    # Callback queries (inline keyboard)
+    # Callbacks
     app.add_handler(CallbackQueryHandler(callback_router))
 
-    # Text messages
+    # Text
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    logger.info("🚀 Execution Companion Bot is running...")
+    logger.info("🚀 Execution Companion Bot v2 is running...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
