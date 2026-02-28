@@ -958,7 +958,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ═══════════════════════════════════════════
 
 def main():
-    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
         print("=" * 50)
         print("ERROR: 请设置环境变量 TELEGRAM_BOT_TOKEN")
